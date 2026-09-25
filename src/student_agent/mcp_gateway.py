@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -7,6 +8,7 @@ from typing import Any
 
 import httpx2
 from mcp import ClientSession
+from mcp.shared.exceptions import MCPError
 from mcp.client.streamable_http import streamable_http_client
 
 from .contracts import Contracts
@@ -24,7 +26,7 @@ class EvidenceGateway:
     async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
         payload = {"case_id": case_id, **arguments}
         result = await self._session.call_tool(tool_name, arguments=payload)
-        if result.isError:
+        if getattr(result, "isError", getattr(result, "is_error", False)):
             message = " ".join(
                 block.text for block in result.content if getattr(block, "text", None)
             )
@@ -47,10 +49,21 @@ async def connect_gateway(
 ) -> AsyncIterator[EvidenceGateway]:
     headers = {"Authorization": f"Bearer {team_api_key}"}
     timeout = httpx2.Timeout(300.0, connect=30.0, write=30.0, pool=30.0)
-    async with (
-        httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
-        streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
-        ClientSession(read_stream, write_stream) as session,
-    ):
-        await session.initialize()
-        yield EvidenceGateway(session, contracts)
+    for attempt in range(3):
+        handed_off = False
+        try:
+            async with (
+                httpx2.AsyncClient(headers=headers, timeout=timeout) as http_client,
+                streamable_http_client(endpoint, http_client=http_client) as (read_stream, write_stream),
+                ClientSession(read_stream, write_stream) as session,
+            ):
+                await session.initialize()
+                handed_off = True
+                yield EvidenceGateway(session, contracts)
+                return
+        except (MCPError, OSError, BaseExceptionGroup):
+            if handed_off:
+                raise
+            if attempt == 2:
+                raise
+            await asyncio.sleep(0.5 * (2**attempt))
